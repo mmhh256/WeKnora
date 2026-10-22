@@ -567,41 +567,35 @@ const batchTagPreSelectedIds = computed(() => {
   return Array.from(firstTagIds);
 });
 // IDs submitted for async batch reparse; hold optimistic pending until the worker updates DB.
-const pendingReparseAck = ref<Set<string>>(new Set());
+const pendingReparseAck = ref<Map<string, number>>(new Map());
+let documentScopeVersion = 0;
+let statusPollVersion = 0;
+
+const invalidateStatusPoll = () => {
+  statusPollVersion++;
+  if (timeout !== null) {
+    clearTimeout(timeout);
+    timeout = null;
+  }
+};
+
+const resetReparseScope = () => {
+  documentScopeVersion++;
+  pendingReparseAck.value.clear();
+  invalidateStatusPoll();
+};
 
 const applyOptimisticBatchReparse = (ids: string[]) => {
   const idSet = new Set(ids);
   for (const card of cardList.value) {
     if (!idSet.has(card.id)) continue;
-    pendingReparseAck.value.add(card.id);
+    pendingReparseAck.value.set(card.id, Date.now() + 12000);
     card.parse_status = 'pending';
     card.summary_status = undefined;
     card.description = '';
     delete traceAvailableById[card.id];
     traceAvailableById[card.id] = true;
   }
-};
-
-const syncReparseAckFromServer = (ids: string[]) => {
-  for (const id of ids) {
-    if (!pendingReparseAck.value.has(id)) continue;
-    const card = cardList.value.find((c) => c.id === id);
-    if (card && isParseInFlight(card.parse_status)) {
-      pendingReparseAck.value.delete(id);
-    }
-  }
-};
-
-const awaitBatchReparseReflection = async (ids: string[]) => {
-  const maxPolls = 30;
-  const delayMs = 400;
-  for (let i = 0; i < maxPolls && pendingReparseAck.value.size > 0; i++) {
-    await loadKnowledgeFiles(kbId.value);
-    syncReparseAckFromServer(ids);
-    applyOptimisticBatchReparse(Array.from(pendingReparseAck.value));
-    await new Promise<void>((r) => setTimeout(r, delayMs));
-  }
-  pendingReparseAck.value.clear();
 };
 
 const confirmBatchReparse = async () => {
@@ -619,16 +613,18 @@ const confirmBatchReparse = async () => {
   if (skipped > 0) {
     MessagePlugin.warning(t('knowledgeBase.batchReparseSkippedInFlight', { count: skipped }));
   }
+  const targetKbId = kbId.value;
+  const scopeVersion = documentScopeVersion;
   batchReparsing.value = true;
   try {
-    const res: any = await batchReparseKnowledge(kbId.value, ids);
+    const res: any = await batchReparseKnowledge(targetKbId, ids);
+    if (scopeVersion !== documentScopeVersion) return;
     if (res?.success) {
       MessagePlugin.success(t('knowledgeBase.batchReparseSuccess', { count: ids.length }));
       applyOptimisticBatchReparse(ids);
       clearSelection();
       batchMode.value = false;
       scheduleWikiStatusProbes();
-      void awaitBatchReparseReflection(ids);
     } else {
       MessagePlugin.error(res?.message || t('knowledgeBase.batchReparseFailed'));
     }
@@ -800,6 +796,8 @@ const folderTreeLoading = ref(false);
 // The folder being browsed; ROOT_FOLDER_PATH ('') is the knowledge base top
 // level, a real node of the tree rather than a separate mode.
 const selectedFolderPath = ref<string>(ROOT_FOLDER_PATH);
+watch([kbId, selectedFolderPath], resetReparseScope, { flush: 'sync' });
+onUnmounted(resetReparseScope);
 const folderTreeCollapsed = ref(readStoredFlag(FOLDER_TREE_COLLAPSED_KEY));
 const hasFolders = computed(() => (folderTree.value?.folders?.length ?? 0) > 0);
 // The folder column only earns its space once the knowledge base actually has
@@ -1466,18 +1464,19 @@ const pollDelayFor = (items: KnowledgeCard[]) =>
     : 1500;
 
 const updateStatus = (analyzeList: KnowledgeCard[], delay = 1500) => {
-  if (timeout !== null) {
-    clearTimeout(timeout);
-    timeout = null;
-  }
+  invalidateStatusPoll();
   if (!analyzeList.length) return;
+  const version = statusPollVersion;
+  const targetKbId = kbId.value;
+  const isActive = () => version === statusPollVersion;
 
   let query = ``;
   for (let i = 0; i < analyzeList.length; i++) {
     query += `ids=${analyzeList[i].id}&`;
   }
   timeout = setTimeout(() => {
-    batchQueryKnowledge(query).then((result: any) => {
+    batchQueryKnowledge(query, targetKbId).then((result: any) => {
+      if (!isActive()) return;
       let shouldRefreshWikiStatus = false;
       if (result.success && result.data) {
         (result.data as KnowledgeCard[]).forEach((item: KnowledgeCard) => {
@@ -1485,8 +1484,11 @@ const updateStatus = (analyzeList: KnowledgeCard[], delay = 1500) => {
           if (index == -1) return;
 
           let parseStatus = item.parse_status;
-          if (pendingReparseAck.value.has(item.id)) {
-            if (isParseInFlight(item.parse_status)) {
+          const ackDeadline = pendingReparseAck.value.get(item.id);
+          if (ackDeadline !== undefined) {
+            // The worker may finish between polls. Bound the optimistic
+            // pending state so a missed acknowledgment cannot spin forever.
+            if (isParseInFlight(item.parse_status) || Date.now() >= ackDeadline) {
               pendingReparseAck.value.delete(item.id);
             } else {
               parseStatus = 'pending';
@@ -1519,6 +1521,7 @@ const updateStatus = (analyzeList: KnowledgeCard[], delay = 1500) => {
         const returnedIds = new Set((result.data as KnowledgeCard[]).map(item => item.id));
         const goneIds = new Set(analyzeList.map(item => item.id).filter(id => !returnedIds.has(id)));
         if (goneIds.size > 0) {
+          goneIds.forEach(id => pendingReparseAck.value.delete(id));
           const before = cardList.value.length;
           cardList.value = cardList.value.filter(card => !goneIds.has(card.id));
           total.value = Math.max(0, total.value - (before - cardList.value.length));
@@ -1535,6 +1538,7 @@ const updateStatus = (analyzeList: KnowledgeCard[], delay = 1500) => {
         updateStatus(stillPending, pollDelayFor(stillPending));
       }
     }).catch((_err) => {
+      if (!isActive()) return;
       // 错误处理
       const stillPending = cardList.value.filter(needsStatusPolling);
       if (stillPending.length > 0) {

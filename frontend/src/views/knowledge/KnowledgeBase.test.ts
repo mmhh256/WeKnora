@@ -13,6 +13,10 @@ async function setup(t: TestContext) {
     getCardDetails: t.mock.fn(), getfDetails() {}, onVisibleChange() {},
   }
   const listKnowledgeFolders = t.mock.fn(async (_id: string) => ({ data: { folders: [] } }))
+  const batchQueryKnowledge = t.mock.fn(async (_query: string, _kbId?: string): Promise<any> => ({
+    success: true, data: new URLSearchParams(_query).getAll('ids').map(id => ({ id, parse_status: 'processing' })),
+  }))
+  const batchReparseKnowledge = t.mock.fn(async (_kbId: string, _ids: string[]): Promise<any> => ({ success: true }))
   const fetchKnowledgeBaseById = t.mock.fn(async (_id: string, _force: boolean) => ({ id: 'kb', type: 'document' }))
   let settle: () => void = () => {}
   const waitForKnowledgeDeletion = t.mock.fn((_ids: string[]) => new Promise<string>((resolve) => {
@@ -21,7 +25,7 @@ async function setup(t: TestContext) {
   const page = f.component(new URL('./KnowledgeBase.vue', import.meta.url), {
     'vue-router': { useRoute: () => route, useRouter: () => ({ replace() {} }) },
     'vue-i18n': { useI18n: () => ({ t: (key: string) => key }) },
-    'tdesign-vue-next': { MessagePlugin: {} },
+    'tdesign-vue-next': { MessagePlugin: { success() {}, error() {}, warning() {}, info() {} } },
     '@/hooks/useKnowledgeBase': () => hook,
     '@/stores/ui': { useUIStore: () => ({ clearSelectedTagIds() {} }) },
     '@/stores/organization': { useOrganizationStore: () => ({ sharedKnowledgeBases: [], getKBPermission: () => 'owner' }) },
@@ -36,8 +40,11 @@ async function setup(t: TestContext) {
     '@/composables/useAssistantPageContext': { useAssistantPageContext() {} },
     '@/utils/kbPermission': {}, '@/utils/knowledgeDeletion': { waitForKnowledgeDeletion }, '@/utils/knowledgeTrace': {},
     '@/utils/knowledgeProcessingStall': stall, '@/api/wiki': {}, '@/api/knowledge-base': {},
-    '@/api/knowledge-base/index': { listKnowledgeFolders, listKnowledgeTags: async () => ({ data: { data: [], total: 0 } }) },
+    '@/api/knowledge-base/index': { listKnowledgeFolders, batchQueryKnowledge, batchReparseKnowledge,
+      listKnowledgeTags: async () => ({ data: { data: [], total: 0 } }) },
   })
+  await flush()
+  hook.cardList.value = [{ id: 'doc', parse_status: 'completed' }]
   await flush()
   page.vm.isCardDetails = true
   hook.getKnowled.mock.resetCalls()
@@ -45,6 +52,7 @@ async function setup(t: TestContext) {
   fetchKnowledgeBaseById.mock.resetCalls()
   return {
     ...f, ...page, route, hook, listKnowledgeFolders, fetchKnowledgeBaseById, waitForKnowledgeDeletion,
+    batchQueryKnowledge, batchReparseKnowledge,
     settleDeletion: () => settle(),
   }
 }
@@ -63,6 +71,151 @@ test('refreshes files and folders for the open KB and ignores unrelated areas an
   assert.equal(f.listKnowledgeFolders.mock.callCount(), 1)
   assert.equal(f.listKnowledgeFolders.mock.calls[0].arguments[0], 'kb')
   assert.equal(f.hook.getCardDetails.mock.callCount(), 0)
+})
+
+test('batch rebuild preserves all loaded pages and uses only the ID status poller', async t => {
+  const f = await setup(t)
+  const rows = Array.from({ length: 100 }, (_, i) => ({ id: `doc-${i}`, parse_status: 'completed' }))
+  f.hook.cardList.value = rows
+  await flush()
+  f.hook.getKnowled.mock.resetCalls()
+  f.vm.selectedIds = new Set(rows.map(row => row.id))
+  await f.vm.confirmBatchReparse()
+  await flush()
+  assert.equal(f.hook.getKnowled.mock.callCount(), 0, 'rebuild must not reload page 1')
+  assert.equal(f.hook.cardList.value.length, 100)
+  assert.equal(f.vm.docListLoading, false)
+  t.mock.timers.tick(1500)
+  await flush()
+  assert.equal(f.batchQueryKnowledge.mock.callCount(), 1)
+  assert.equal(f.batchQueryKnowledge.mock.calls[0].arguments[1], 'kb')
+  assert.equal(f.hook.cardList.value.length, 100)
+  assert.equal(f.hook.cardList.value[0].parse_status, 'processing')
+  assert.equal(f.vm.docListLoading, false)
+  assert.equal(f.hook.getKnowled.mock.callCount(), 0)
+})
+
+test('a delayed status response cannot mutate a new folder or restart polling after unmount', async t => {
+  const f = await setup(t)
+  let respond!: (value: any) => void
+  f.batchQueryKnowledge.mock.mockImplementation(() => new Promise(resolve => { respond = resolve }))
+  f.vm.selectedIds = new Set(['doc'])
+  await f.vm.confirmBatchReparse()
+  await flush()
+  t.mock.timers.tick(1500)
+  await flush()
+  f.vm.selectedFolderPath = 'other'
+  await flush()
+  f.hook.cardList.value = [{ id: 'doc', parse_status: 'completed' }]
+  await flush()
+  respond({ success: true, data: [{ id: 'doc', parse_status: 'processing' }] })
+  await flush()
+  assert.equal(f.hook.cardList.value[0].parse_status, 'completed')
+  f.close()
+  const calls = f.batchQueryKnowledge.mock.callCount()
+  t.mock.timers.tick(15000)
+  await flush()
+  assert.equal(f.batchQueryKnowledge.mock.callCount(), calls)
+})
+
+test('waits for worker acknowledgment but accepts terminal status when the acknowledgment window expires', async t => {
+  const f = await setup(t)
+  f.batchQueryKnowledge.mock.mockImplementation(async () => ({
+    success: true, data: [{ id: 'doc', parse_status: 'completed', summary_status: 'completed', description: 'Done' }],
+  }))
+  f.vm.selectedIds = new Set(['doc'])
+  await f.vm.confirmBatchReparse()
+  await flush()
+  t.mock.timers.tick(1500)
+  await flush()
+  assert.equal(f.hook.cardList.value[0].parse_status, 'pending')
+  // Expire this request's deadline without sleeping or changing wall-clock time.
+  f.vm.pendingReparseAck.set('doc', 0)
+  t.mock.timers.tick(1500)
+  await flush()
+  assert.equal(f.hook.cardList.value[0].parse_status, 'completed')
+  assert.equal(f.vm.pendingReparseAck.size, 0)
+  const calls = f.batchQueryKnowledge.mock.callCount()
+  t.mock.timers.tick(15000)
+  await flush()
+  assert.equal(f.batchQueryKnowledge.mock.callCount(), calls)
+  assert.equal(f.hook.getKnowled.mock.callCount(), 0)
+})
+
+test('overlapping batch submissions share one status timer and clear acknowledged IDs independently', async t => {
+  const f = await setup(t)
+  f.hook.cardList.value = [
+    { id: 'doc', parse_status: 'completed' }, { id: 'second', parse_status: 'completed' },
+  ]
+  await flush()
+  f.vm.selectedIds = new Set(['doc'])
+  await f.vm.confirmBatchReparse()
+  await flush()
+  f.vm.selectedIds = new Set(['second'])
+  await f.vm.confirmBatchReparse()
+  await flush()
+  f.batchQueryKnowledge.mock.mockImplementation(async () => ({ success: true, data: [
+    { id: 'doc', parse_status: 'processing' }, { id: 'second', parse_status: 'completed' },
+  ] }))
+  t.mock.timers.tick(1500)
+  await flush()
+  assert.equal(f.batchQueryKnowledge.mock.callCount(), 1)
+  assert.equal(f.vm.pendingReparseAck.has('doc'), false)
+  assert.equal(f.vm.pendingReparseAck.has('second'), true)
+  assert.deepEqual(f.hook.cardList.value.map(row => row.parse_status), ['processing', 'pending'])
+  assert.equal(f.hook.getKnowled.mock.callCount(), 0)
+})
+
+test('ignores a batch submission that completes after navigation', async t => {
+  const f = await setup(t)
+  let respond!: (value: any) => void
+  f.batchReparseKnowledge.mock.mockImplementation(() => new Promise(resolve => { respond = resolve }))
+  f.vm.selectedIds = new Set(['doc'])
+  const submission = f.vm.confirmBatchReparse()
+  f.vm.selectedFolderPath = 'other'
+  await flush()
+  respond({ success: true })
+  await submission
+  await flush()
+  assert.equal(f.hook.cardList.value[0].parse_status, 'completed')
+  assert.equal(f.vm.pendingReparseAck.size, 0)
+})
+
+for (const outcome of ['success', 'error'] as const) {
+  test(`a pending status ${outcome} after unmount cannot reschedule requests`, async t => {
+    const f = await setup(t)
+    let finish!: () => void
+    f.batchQueryKnowledge.mock.mockImplementation(() => new Promise((resolve, reject) => {
+      finish = () => outcome === 'success'
+        ? resolve({ success: true, data: [{ id: 'doc', parse_status: 'processing' }] })
+        : reject(new Error('network failure'))
+    }))
+    f.vm.selectedIds = new Set(['doc'])
+    await f.vm.confirmBatchReparse()
+    await flush()
+    t.mock.timers.tick(1500)
+    await flush()
+    f.close()
+    finish()
+    await flush()
+    t.mock.timers.tick(15000)
+    await flush()
+    assert.equal(f.batchQueryKnowledge.mock.callCount(), 1)
+    assert.equal(f.vm.pendingReparseAck.size, 0)
+  })
+}
+
+test('removes missing submitted rows and their optimistic acknowledgment state', async t => {
+  const f = await setup(t)
+  f.batchQueryKnowledge.mock.mockImplementation(async () => ({ success: true, data: [] }))
+  f.vm.selectedIds = new Set(['doc'])
+  await f.vm.confirmBatchReparse()
+  await flush()
+  t.mock.timers.tick(1500)
+  await flush()
+  assert.equal(f.hook.cardList.value.length, 0)
+  assert.equal(f.hook.total.value, 0)
+  assert.equal(f.vm.pendingReparseAck.size, 0)
 })
 
 test('reloads KB metadata with force without adding file requests beyond the existing loader', async t => {
